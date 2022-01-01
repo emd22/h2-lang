@@ -292,23 +292,50 @@ class PPDefinition():
         self.fnode = fnode
     def __repr__(self):
         return "[PPDef: {} | {}]".format(self.name, self.data)
+        
+class CodeGeneration():
+    def __init__(self):
+        self.text = ""
+        self.data = ""
+        self.bss = ""
+        
+        self.pre = ""
+    def output(self):
+        print("=== ASM ===")
+        output = \
+        """
+{}
+section .text
+{}
+section .data
+{}
+section .bss
+{}
+        """.format(self.pre, self.text, self.data, self.bss)
+        return output
 
 class PreProcess(NodeVisitor):
     def __init__(self, tokens, ast):
         self.tokens = tokens
         self.ast = ast
-        self.asm_out = ""
+        self.ostack = []
+        self.cg = CodeGeneration()
         self.definitions = [
             PPDefinition("_macro", "<INTERNAL>", self.int_define),
             PPDefinition("_fmacro", "<INTERNAL>", self.int_fdefine),
+            PPDefinition("_delete", "<INTERNAL>", self.int_delete),
             PPDefinition("_setmacro", "<INTERNAL>", self.int_dset),
             PPDefinition("_debugvar", "<INTERNAL>", self.int_dprt),
             PPDefinition("_add", "<INTERNAL>", self.int_add),
             PPDefinition("_T", "<INTERNAL>", self.int_gettok),
             # use the builtin variable '$' to get current token index
             PPDefinition("_dvars", "<INTERNAL>", self.int_dvars),
-            PPDefinition("_asm", "<INTERNAL>", self.int_asm),
-            PPDefinition("_arg", [], self.int_arg),
+            
+            PPDefinition("_push", "", self.int_push),
+            PPDefinition("_pop", "", self.int_pop),
+            
+            # code generation
+            PPDefinition("_appsec", "<INTERNAL>", self.int_appsec),
         ]
 
     def get_def(self, name):
@@ -316,6 +343,7 @@ class PreProcess(NodeVisitor):
         for definition in self.definitions:
             if definition.name == name:
                 return definition
+                
     def set_def(self, name, data):
         pcall = None
         for definition in self.definitions:
@@ -323,17 +351,35 @@ class PreProcess(NodeVisitor):
                 definition.data = data
                 return definition
                 
+    def int_appsec(self, fcall_node):
+        arg_node = fcall_node.children[1]
+        section = int(self.visit(arg_node.children[0]))
+        output = None
+        
+        for child in arg_node.children[1:]:
+            value = str(self.visit(child))
+            if (section == 0):
+                self.cg.text += value
+            elif (section == 1):
+                self.cg.data += value
+            elif (section == 2):
+                self.cg.bss += value
+            elif (section == 3):
+                self.cg.pre += value
+                
     def int_asm(self, fcall_node):
         arg_node = fcall_node.children[1]
         for child in arg_node.children:
             self.asm_out += self.visit(child)
         return 0
-
-    def int_arg(self, fcall_node):
+        
+    def int_push(self, fcall_node):
         arg_node = fcall_node.children[1]
-        arg_index = int(self.visit(arg_node.children[0]))
-        pcall = self.get_def("_arg")
-        return pcall.data[arg_index]
+        for child in arg_node.children:
+            self.ostack.append(self.visit(child))
+
+    def int_pop(self, fcall_node):
+        return self.visit(self.ostack.pop())
 
     def int_gettok(self, fcall_node):
         arg_node = fcall_node.children[1]
@@ -376,6 +422,13 @@ class PreProcess(NodeVisitor):
         data = arg_node.children[1]
         self.definitions.append(PPDefinition(name, data, fnode=data))
         return data
+        
+    def int_delete(self, fcall_node):
+        arg_node = fcall_node.children[1]
+        name = arg_node.children[0].token.data
+        for definition in self.definitions:
+            if definition.name == name:
+                self.definitions.delete(definition)
 
     def int_define(self, fcall_node):
         arg_node = fcall_node.children[1]
@@ -437,8 +490,9 @@ class PreProcess(NodeVisitor):
         symbol = node.children[0]
         pcall = self.get_def(self.visit(symbol))
         if pcall.fnode != None:
-            args = self.visit(node.children[1])
-            self.set_def("_arg", args)
+            args = node.children[1].children
+            for arg in reversed(args):
+                self.ostack.append(arg)
             rval = self.visit(pcall.fnode)
         elif pcall.func != None:
             rval = pcall.func(node)
@@ -451,16 +505,45 @@ class PreProcess(NodeVisitor):
 
 def main():
     input = """
-        _fmacro(_PostLabel, { _asm(_arg(0), ':\n'); });
-        _fmacro(_AsmInit, {
-            _asm("global _start\n");
-            _asm("_start")
+        {
+            _macro(%_TEXT, 0);
+            _macro(%_DATA, 1);
+            _macro(%_BSS, 2);
+            _macro(%_PRE, 3);
+        };
+        
+        _fmacro(_label, _appsec(%_TEXT, _pop(), ":\n"));
+        _fmacro(_asminit, {
+            _appsec(%_PRE, "global _start\n");
         });
-        _fmacro(ftest, {
-            _macro(%this, _arg(0));
-            _debugvar(%this);
+        _fmacro(_alloc, {
+            _appsec(%_DATA, _pop(), ": db ", _pop(), "\n");
         });
-        ftest("Big ol' Test", 2);
+        _fmacro(_syscall, {
+            _appsec(%_TEXT, "mov rax, ", _pop(), "\n");
+            _appsec(%_TEXT, "syscall\n");
+        });
+        _fmacro(_sysprintn, {
+            _appsec(%_TEXT, "mov rsi, ", _pop(), "\n");
+            _appsec(%_TEXT, "mov rdx, ", _pop(), "\n");
+            _appsec(%_TEXT, "mov rdi, 1\n");
+            _syscall(1);
+        });
+        _fmacro(_null, {});
+        _fmacro(_loop, {
+            _appsec(%_TEXT, "mov rcx, ", _pop(), "\n");
+            _appsec(%_TEXT, _pop(), ":\n");
+            _pop();
+            _appsec(%_TEXT, "dec rcx\n");
+            _appsec(%_TEXT, "cmp rcx, 0\n");
+            _appsec(%_TEXT, "jnz L0\n");
+        });
+        
+        _asminit();
+        _label("_start");
+        _alloc(hw_str, "'Hello, World!', 10");
+        _sysprintn(hw_str, 14);
+        _syscall(60);
     """
     lexer = Lexer(input)
     lexer.lex()
@@ -472,7 +555,8 @@ def main():
 
     pp = PreProcess(lexer.tokens, tree)
     pp.pp()
-
-    print("===ASM===")
-    print(pp.asm_out)
+    
+    asm_file = open("output.asm", "w")
+    asm_file.write(pp.cg.output())
+    asm_file.close()
 main()
